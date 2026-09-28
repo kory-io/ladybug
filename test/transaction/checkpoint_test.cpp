@@ -1760,5 +1760,63 @@ TEST_F(FailedInPlaceCheckpointTest, NodeColumnsReadBackAfterFailedCheckpointOfLa
     check("after reopening");
 }
 
+// Repeated failed checkpoints of a rel table with a list property must not grow its storage:
+// after a successful checkpoint, the rel table uses as many values and pages as it does when the
+// failed checkpoints never ran.
+TEST_F(FailedInPlaceCheckpointTest, RelListStorageDoesNotGrowAcrossFailedCheckpoints) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    constexpr int64_t numNodes = 1000;
+    constexpr int numRounds = 5;
+    auto runQuery = [&](const std::string& query) {
+        auto res = conn->query(query);
+        ASSERT_TRUE(res->isSuccess()) << query << ": " << res->getErrorMessage();
+    };
+    // Per column of the rel table: total values and pages over all its chunks.
+    auto storage = [&](const std::string& table) {
+        return queryRows(std::format("CALL storage_info('{}') RETURN column_name, "
+                                     "CAST(SUM(num_values) AS INT64), CAST(SUM(num_pages) AS "
+                                     "INT64) ORDER BY column_name;",
+            table));
+    };
+    auto setUp = [&](const std::string& t) {
+        runQuery(std::format("CREATE NODE TABLE n{}(id INT64 PRIMARY KEY);", t));
+        runQuery(std::format("CREATE REL TABLE e{0}(FROM n{0} TO n{0}, vals INT64[]);", t));
+        runQuery(std::format("UNWIND range(0, {}) AS i CREATE (:n{} {{id: i}});", numNodes - 1, t));
+        runQuery(std::format("MATCH (a:n{0}), (b:n{0}) WHERE b.id = (a.id + 1) % {1} "
+                             "CREATE (a)-[:e{0} {{vals: [a.id]}}]->(b);",
+            t, numNodes));
+        runQuery("CHECKPOINT;");
+    };
+    auto addRel = [&](const std::string& t, int round) {
+        runQuery(std::format("MATCH (a:n{0} {{id: 0}}), (b:n{0} {{id: {1}}}) CREATE "
+                             "(a)-[:e{0} {{vals: [{1}, {1}, {1}, {1}]}}]->(b);",
+            t, 500 + round));
+    };
+    setUp("_failed");
+    for (auto round = 0; round < numRounds; round++) {
+        addRel("_failed", round);
+        failFirstAllocationInCheckpoint();
+    }
+    checkpoint();
+    // The same rels in a table that only ever sees successful checkpoints.
+    setUp("_control");
+    for (auto round = 0; round < numRounds; round++) {
+        addRel("_control", round);
+    }
+    auto rels = [&](const std::string& t) {
+        return queryRows(std::format(
+            "MATCH (a:n{0})-[r:e{0}]->(b:n{0}) RETURN a.id, b.id, r.vals ORDER BY a.id, b.id;", t));
+    };
+    checkpoint();
+    EXPECT_EQ(rels("_failed"), rels("_control"));
+    const auto failed = storage("e_failed");
+    const auto control = storage("e_control");
+    EXPECT_EQ(failed, control);
+}
+
 } // namespace testing
 } // namespace lbug
