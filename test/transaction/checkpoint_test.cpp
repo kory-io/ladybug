@@ -1395,5 +1395,143 @@ TEST_F(FailedInPlaceCheckpointTest, RelsReadBackAfterFailedCSRHeaderCheckpoint) 
     check("after reopening");
 }
 
+// The in-place checkpoint of a list column appends the new lists to the list data and installs
+// their offsets before the list sizes are checkpointed. All persistent lists have a single element,
+// so the list sizes are constant-compressed, while the list data and offsets leave room in their
+// bit widths and pages. Appending a few longer lists to the persistent node group then extends the
+// list data and offsets in place and only the size column has to be rewritten out of place, which
+// is where the injected allocation failure lands.
+TEST_F(FailedInPlaceCheckpointTest, ListsReadBackAfterFailedListSizeCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE t(id INT64 PRIMARY KEY, vals INT64[]);")->isSuccess());
+    constexpr int64_t numPersistentRows = 1000;
+    constexpr int64_t numRows = numPersistentRows + 5;
+    auto listOf = [&](int64_t i) {
+        return i < numPersistentRows ? std::format("[{}]", i) :
+                                       std::format("[{},{},{}]", i - numPersistentRows,
+                                           i - numPersistentRows, i - numPersistentRows);
+    };
+    auto res = conn->query(std::format("UNWIND range(0, {}) AS i CREATE (:t {{id: i, vals: [i]}});",
+        numPersistentRows - 1));
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    checkpoint();
+    for (auto i = numPersistentRows; i < numRows; i++) {
+        res = conn->query(std::format("CREATE (:t {{id: {}, vals: {}}});", i, listOf(i)));
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    }
+
+    std::vector<std::string> expected;
+    for (int64_t i = 0; i < numRows; i++) {
+        expected.push_back(std::format("{}|{}", i, listOf(i)));
+    }
+    const std::string query = "MATCH (x:t) RETURN x.id, x.vals ORDER BY x.id;";
+    auto check = [&](const std::string& when) {
+        EXPECT_EQ(queryRows(query), expected) << when;
+    };
+    check("before the failed checkpoint");
+    failFirstAllocationInCheckpoint();
+    check("after the failed checkpoint");
+    checkpoint();
+    check("after the retried checkpoint");
+    // Query results must not outlive the database they were read from.
+    res.reset();
+    createDBAndConn();
+    check("after reopening");
+}
+
+// Updates to persistent rows rewrite every list of the segment: the list data of all rows is
+// appended again and every offset is replaced. Shrinking most of the lists keeps the appended
+// data small enough for the offsets to stay within their bit width, so the list data and offsets
+// are still rewritten in place, and only the size column (constant before the update) has to be
+// rewritten out of place, which is where the injected allocation failure lands.
+TEST_F(FailedInPlaceCheckpointTest, UpdatedListsReadBackAfterFailedListSizeCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(
+        conn->query("CREATE NODE TABLE t(id INT64 PRIMARY KEY, vals INT64[]);")->isSuccess());
+    constexpr int64_t numRows = 600;
+    auto isUpdated = [](int64_t i) { return i % 4 != 3; };
+    auto res = conn->query(std::format(
+        "UNWIND range(0, {}) AS i CREATE (:t {{id: i, vals: [i, i]}});", numRows - 1));
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    checkpoint();
+    res = conn->query("MATCH (x:t) WHERE x.id % 4 <> 3 SET x.vals = [x.id];");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+
+    std::vector<std::string> expected;
+    for (int64_t i = 0; i < numRows; i++) {
+        expected.push_back(isUpdated(i) ? std::format("{}|[{}]", i, i) :
+                                          std::format("{}|[{},{}]", i, i, i));
+    }
+    const std::string query = "MATCH (x:t) RETURN x.id, x.vals ORDER BY x.id;";
+    auto check = [&](const std::string& when) {
+        EXPECT_EQ(queryRows(query), expected) << when;
+    };
+    check("before the failed checkpoint");
+    failFirstAllocationInCheckpoint();
+    check("after the failed checkpoint");
+    checkpoint();
+    check("after the retried checkpoint");
+    // Query results must not outlive the database they were read from.
+    res.reset();
+    createDBAndConn();
+    check("after reopening");
+}
+
+// A node group checkpoint rewrites the persistent column chunks one column at a time. Columns
+// before the failing one are already extended with the inserted rows when the checkpoint fails,
+// so the retry has to merge the same updates and insertions into them again.
+TEST_F(FailedInPlaceCheckpointTest, NodeColumnsReadBackAfterFailedCheckpointOfLaterColumn) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE t(id INT64 PRIMARY KEY, a INT64, name STRING);")
+                    ->isSuccess());
+    constexpr int64_t numInitialRows = 2100;
+    constexpr int64_t numRows = 2700;
+    constexpr std::string_view namePrefix = "a longer name so the pages fill up ";
+    auto insertRows = [&](int64_t start, int64_t end) {
+        auto res = conn->query(std::format("UNWIND range({}, {}) AS i CREATE (:t {{id: i, a: i, "
+                                           "name: concat('{}', CAST(i AS STRING))}});",
+            start, end - 1, namePrefix));
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    };
+    insertRows(0, numInitialRows);
+    checkpoint();
+    auto res = conn->query("MATCH (x:t) WHERE x.id % 7 = 0 SET x.a = x.id + 1;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    insertRows(numInitialRows, numRows);
+    res = conn->query("MATCH (x:t) WHERE x.id % 7 = 0 SET x.a = x.id + 1;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+
+    std::vector<std::string> expected;
+    for (int64_t i = 0; i < numRows; i++) {
+        expected.push_back(std::format("{}|{}|{}{}", i, i % 7 == 0 ? i + 1 : i, namePrefix, i));
+    }
+    const std::string query = "MATCH (x:t) RETURN x.id, x.a, x.name ORDER BY x.id;";
+    auto check = [&](const std::string& when) {
+        EXPECT_EQ(queryRows(query), expected) << when;
+    };
+    check("before the failed checkpoint");
+    failFirstAllocationInCheckpoint();
+    check("after the failed checkpoint");
+    checkpoint();
+    check("after the retried checkpoint");
+    // Query results must not outlive the database they were read from.
+    res.reset();
+    createDBAndConn();
+    check("after reopening");
+}
+
 } // namespace testing
 } // namespace lbug
