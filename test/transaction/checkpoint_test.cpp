@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -10,13 +11,19 @@
 
 #include "api_test/private_api_test.h"
 #include "catalog/catalog.h"
+#include "catalog/catalog_entry/rel_group_catalog_entry.h"
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/exception/runtime.h"
 #include "storage/checkpointer.h"
+#include "storage/index/hash_index.h"
 #include "storage/page_allocator.h"
 #include "storage/page_manager.h"
 #include "storage/storage_manager.h"
+#include "storage/table/csr_chunked_node_group.h"
+#include "storage/table/csr_node_group.h"
 #include "storage/table/node_table.h"
+#include "storage/table/rel_table.h"
+#include "storage/table/rel_table_data.h"
 #include "storage/table/string_chunk_data.h"
 #include "storage/wal/wal.h"
 #include "test_env.h"
@@ -653,6 +660,482 @@ TEST_F(FlakyCheckpointerTest, ReadBeforeShadowPagesAreAppliedSeesCommittedString
     for (auto i = 0u; i < numRows; i++) {
         EXPECT_EQ(readNames[i], getName(i));
     }
+}
+
+// Readers of other storage structures during the same window: between a checkpoint's in-place
+// shadow writes and the application of the shadow pages to the data file.
+class CheckpointShadowWindowTest : public FlakyCheckpointerTest {
+public:
+    void SetUp() override {
+        FlakyCheckpointerTest::SetUp();
+        ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+        ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    }
+
+    void runQuery(const std::string& query) const {
+        auto res = conn->query(query);
+        ASSERT_TRUE(res->isSuccess()) << query << ": " << res->getErrorMessage();
+    }
+
+    // Runs one CHECKPOINT that calls `readFunc` right before the shadow pages are applied.
+    void checkpointWithReadInWindow(const std::function<void()>& readFunc) const {
+        auto context = getClientContext(*conn);
+        FlakyCheckpointer checkpointer([&](main::ClientContext& clientContext) {
+            return std::make_unique<CheckpointerWithReadBeforeApplyingShadowPages>(clientContext,
+                readFunc);
+        });
+        checkpointer.setCheckpointer(*context);
+        auto res = conn->query("CHECKPOINT;");
+        FlakyCheckpointer::resetCheckpointer(*context);
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    }
+
+    // Number of pages of the primary key index of `tableName` (slots and string overflow) that
+    // currently have a shadow page, and the total number of such pages.
+    std::pair<uint64_t, uint64_t> countShadowedPKIndexPages(const std::string& tableName,
+        std::string& breakdown) const {
+        auto context = getClientContext(*conn);
+        auto storageManager = StorageManager::Get(*context);
+        const auto tableEntry = catalog::Catalog::Get(*context)->getTableCatalogEntry(
+            &DUMMY_CHECKPOINT_TRANSACTION, tableName);
+        auto& nodeTable = storageManager->getTable(tableEntry->getTableID())->cast<NodeTable>();
+        auto& shadowFile = storageManager->getShadowFile();
+        const auto fileIdx = storageManager->getDataFH()->getFileIndex();
+        uint64_t numPages = 0, numShadowed = 0;
+        for (const auto& entry : nodeTable.getPKIndex()->getStorageEntries()) {
+            if (entry.component != "primary_slots" && entry.component != "overflow_slots" &&
+                entry.component != "string_overflow") {
+                continue;
+            }
+            uint64_t numShadowedInEntry = 0;
+            for (auto i = 0u; i < entry.pageRange.numPages; i++) {
+                numPages++;
+                numShadowedInEntry +=
+                    shadowFile.hasShadowPage(fileIdx, entry.pageRange.startPageIdx + i);
+            }
+            if (numShadowedInEntry > 0 && breakdown.find(entry.component) == std::string::npos) {
+                breakdown += " " + entry.component;
+            }
+            numShadowed += numShadowedInEntry;
+        }
+        return {numPages, numShadowed};
+    }
+
+    // Looks up every key through the primary key (`WHERE t.id = <key>`) on a new connection and
+    // returns, for each key, the names found.
+    std::vector<std::vector<std::string>> lookupKeys(const std::vector<std::string>& keyLiterals,
+        std::string& error) const {
+        std::vector<std::vector<std::string>> result(keyLiterals.size());
+        auto readConn = std::make_unique<main::Connection>(database.get());
+        for (auto i = 0u; i < keyLiterals.size(); i++) {
+            auto res = readConn->query(
+                std::format("MATCH (t:test) WHERE t.id = {} RETURN t.name;", keyLiterals[i]));
+            if (!res->isSuccess()) {
+                error = res->getErrorMessage();
+                return result;
+            }
+            while (res->hasNext()) {
+                result[i].push_back(res->getNext()->getValue(0)->getValue<std::string>());
+            }
+        }
+        return result;
+    }
+
+    // Primary key lookups while the checkpoint that merges the index inserts (and applies the
+    // deletions) of `numInitialRows..numRows` is in its shadow page window.
+    void runPKLookupDuringShadowWindow(const std::string& keyType,
+        const std::function<std::string(int64_t)>& keyLiteral, bool reopenAfterFirstCheckpoint) {
+        constexpr int64_t numInitialRows = 1000;
+        constexpr int64_t numRows = 1200;
+        // One deleted key that was checkpointed before and one that was not.
+        const std::unordered_set<int64_t> deletedKeys{5, 1100};
+        runQuery(std::format("CREATE NODE TABLE test(id {} PRIMARY KEY, name STRING);", keyType));
+        auto insertRows = [&](int64_t start, int64_t end) {
+            for (auto i = start; i < end; i++) {
+                runQuery(
+                    std::format("CREATE (:test {{id: {}, name: 'name_{}'}});", keyLiteral(i), i));
+            }
+        };
+        insertRows(0, numInitialRows);
+        runQuery("CHECKPOINT;");
+        if (reopenAfterFirstCheckpoint) {
+            createDBAndConn();
+            runQuery("CALL force_checkpoint_on_close=false;");
+            runQuery("CALL auto_checkpoint=false;");
+        }
+        // Few enough new keys that they fit in the slots already on disk, so the checkpoint
+        // merges them into existing slot pages in place (through the shadow file).
+        insertRows(numInitialRows, numRows);
+        for (const auto key : deletedKeys) {
+            runQuery(std::format("MATCH (t:test) WHERE t.id = {} DELETE t;", keyLiteral(key)));
+        }
+
+        std::vector<std::string> keyLiterals;
+        for (auto i = 0; i < numRows; i++) {
+            keyLiterals.push_back(keyLiteral(i));
+        }
+        auto checkLookups = [&](const std::vector<std::vector<std::string>>& found,
+                                const std::string& when) {
+            std::vector<int64_t> wrongKeys;
+            for (auto i = 0; i < numRows; i++) {
+                std::vector<std::string> expected;
+                if (!deletedKeys.contains(i)) {
+                    expected.push_back(std::format("name_{}", i));
+                }
+                if (found[i] != expected) {
+                    wrongKeys.push_back(i);
+                }
+            }
+            std::string sample;
+            for (auto i = 0u; i < std::min<size_t>(wrongKeys.size(), 10); i++) {
+                sample += std::format(" {}(found {})", wrongKeys[i], found[wrongKeys[i]].size());
+            }
+            EXPECT_TRUE(wrongKeys.empty())
+                << when << ": " << wrongKeys.size() << " of " << numRows
+                << " primary key lookups returned wrong results, e.g." << sample;
+        };
+
+        bool readRan = false;
+        std::pair<uint64_t, uint64_t> shadowedPages;
+        std::string shadowedBreakdown;
+        std::string readError;
+        std::vector<std::vector<std::string>> found;
+        checkpointWithReadInWindow([&]() {
+            shadowedPages = countShadowedPKIndexPages("test", shadowedBreakdown);
+            std::thread reader([&]() {
+                found = lookupKeys(keyLiterals, readError);
+                readRan = true;
+            });
+            reader.join();
+        });
+        ASSERT_TRUE(readRan);
+        ASSERT_TRUE(readError.empty()) << readError;
+        // The updated index pages are only in the shadow file at this point.
+        ASSERT_GT(shadowedPages.second, 0u) << "of " << shadowedPages.first << " index pages";
+        checkLookups(found,
+            std::format("during the shadow page window ({} of {} index pages shadowed:{})",
+                shadowedPages.second, shadowedPages.first, shadowedBreakdown));
+
+        std::string afterError;
+        const auto foundAfter = lookupKeys(keyLiterals, afterError);
+        ASSERT_TRUE(afterError.empty()) << afterError;
+        checkLookups(foundAfter, "after the checkpoint");
+    }
+};
+
+// Reopens the database after the first checkpoint. Without the reopen, the second checkpoint
+// currently updates the existing slot pages in place without shadowing them: a disk array only
+// shadows pages up to its last page on disk, which it recomputes from its read header when
+// checkpointed in memory, but the primary key index publishes the new read headers of its disk
+// arrays only after that. Loading the index from disk sets the last page on disk correctly.
+TEST_F(CheckpointShadowWindowTest, Int64PrimaryKeyLookupDuringShadowWindowAfterReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runPKLookupDuringShadowWindow("INT64", [](int64_t i) { return std::to_string(i); },
+        true /*reopenAfterFirstCheckpoint*/);
+}
+
+// Without a reopen only the string overflow pages of the new keys are shadowed (see above).
+TEST_F(CheckpointShadowWindowTest, StringPrimaryKeyLookupDuringShadowWindow) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    // Longer than the inline string limit, so the keys live in the index's overflow file.
+    runPKLookupDuringShadowWindow("STRING",
+        [](int64_t i) { return std::format("'a primary key longer than inline {:05}'", i); },
+        false /*reopenAfterFirstCheckpoint*/);
+}
+
+TEST_F(CheckpointShadowWindowTest, StringPrimaryKeyLookupDuringShadowWindowAfterReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runPKLookupDuringShadowWindow("STRING",
+        [](int64_t i) { return std::format("'a primary key longer than inline {:05}'", i); },
+        true /*reopenAfterFirstCheckpoint*/);
+}
+
+// Pauses a query at the first row it evaluates `pause_scan(x)` on, until released, so that a scan
+// can be left in progress while another thread checkpoints.
+class ScanPauser {
+public:
+    static ScanPauser& get() {
+        static ScanPauser pauser;
+        return pauser;
+    }
+
+    void reset() {
+        std::lock_guard lck{mtx};
+        paused = false;
+        released = false;
+        numCalls = 0;
+    }
+
+    static int64_t pauseScan(int64_t value) {
+        auto& pauser = get();
+        std::unique_lock lck{pauser.mtx};
+        if (pauser.numCalls++ == 0) {
+            pauser.paused = true;
+            pauser.cv.notify_all();
+            pauser.cv.wait_for(lck, std::chrono::seconds(60), [&] { return pauser.released; });
+        }
+        return value;
+    }
+
+    bool waitUntilPaused() {
+        std::unique_lock lck{mtx};
+        return cv.wait_for(lck, std::chrono::seconds(60), [&] { return paused; });
+    }
+
+    void release() {
+        std::lock_guard lck{mtx};
+        released = true;
+        cv.notify_all();
+    }
+
+private:
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool paused = false;
+    bool released = false;
+    uint64_t numCalls = 0;
+};
+
+class CheckpointRunningRelScanTest : public CheckpointShadowWindowTest {
+public:
+    static constexpr int64_t numDsts = 6000;
+
+    void SetUp() override {
+        CheckpointShadowWindowTest::SetUp();
+        runQuery("CREATE NODE TABLE P(id INT64 PRIMARY KEY);");
+        runQuery("CREATE REL TABLE K(FROM P TO P, w INT64);");
+        runQuery(std::format("UNWIND range(0, {}) AS i CREATE (:P {{id: i}});", numDsts));
+        runQuery("CHECKPOINT;");
+        ScanPauser::get().reset();
+        conn->createScalarFunction("pause_scan", &ScanPauser::pauseScan);
+    }
+
+    // All rels come from node 0, so a single bound node has many more rels than fit in one
+    // vector and a scan of its list pauses in the middle.
+    void insertRels(int64_t start, int64_t end) const {
+        runQuery(std::format("MATCH (a:P), (b:P) WHERE a.id = 0 AND b.id >= {} AND b.id < {} "
+                             "CREATE (a)-[:K {{w: b.id}}]->(b);",
+            start, end));
+    }
+
+    static std::string scanQuery(bool pause) {
+        // Only properties of the rels and the neighbor IDs stored with them, so that the rel scan
+        // and pause_scan run in the same pipeline, one vector at a time.
+        return std::format("MATCH (a:P)-[r:K]->(b:P) WHERE a.id = 0 RETURN {}, offset(id(b));",
+            pause ? "pause_scan(r.w)" : "r.w");
+    }
+
+    // Scans the rels of node 0 on a new single-threaded connection.
+    std::vector<int64_t> scanRels(bool pause, std::string& error) const {
+        auto readConn = std::make_unique<main::Connection>(database.get());
+        readConn->setMaxNumThreadForExec(1);
+        auto res = readConn->query(scanQuery(pause));
+        std::vector<int64_t> ws;
+        if (!res->isSuccess()) {
+            error = res->getErrorMessage();
+            return ws;
+        }
+        while (res->hasNext()) {
+            auto row = res->getNext();
+            const auto w = row->getValue(0)->getValue<int64_t>();
+            if (w != row->getValue(1)->getValue<int64_t>()) {
+                error = std::format("rel with w {} points to node {}", w,
+                    row->getValue(1)->getValue<int64_t>());
+            }
+            ws.push_back(w);
+        }
+        std::sort(ws.begin(), ws.end());
+        return ws;
+    }
+
+    static std::vector<int64_t> expectedRels(int64_t start, int64_t end,
+        const std::unordered_set<int64_t>& deleted = {}) {
+        std::vector<int64_t> result;
+        for (auto i = start; i < end; i++) {
+            if (!deleted.contains(i)) {
+                result.push_back(i);
+            }
+        }
+        return result;
+    }
+
+    static void checkRels(const std::vector<int64_t>& actual, const std::vector<int64_t>& expected,
+        const std::string& when) {
+        std::vector<int64_t> missing, extra;
+        std::set_difference(expected.begin(), expected.end(), actual.begin(), actual.end(),
+            std::back_inserter(missing));
+        std::set_difference(actual.begin(), actual.end(), expected.begin(), expected.end(),
+            std::back_inserter(extra));
+        EXPECT_EQ(actual.size(), expected.size()) << when;
+        EXPECT_TRUE(missing.empty() && extra.empty())
+            << when << ": " << missing.size() << " rels missing (first "
+            << (missing.empty() ? -1 : missing.front()) << "), " << extra.size()
+            << " unexpected (first " << (extra.empty() ? -1 : extra.front()) << ")";
+    }
+
+    // Starts a scan of the rels of node 0, pauses it after its first vector, runs a checkpoint
+    // and resumes the scan either inside the checkpoint's shadow page window or after the
+    // checkpoint has finished.
+    std::vector<int64_t> scanAcrossCheckpoint(bool resumeInShadowWindow, std::string& error) {
+        auto& pauser = ScanPauser::get();
+        std::vector<int64_t> ws;
+        std::thread reader([&]() { ws = scanRels(true /*pause*/, error); });
+        if (!pauser.waitUntilPaused()) {
+            pauser.release();
+            reader.join();
+            ADD_FAILURE() << "the scan did not reach pause_scan";
+            return ws;
+        }
+        auto checkpoint = std::async(std::launch::async, [&]() {
+            if (!resumeInShadowWindow) {
+                auto res = conn->query("CHECKPOINT;");
+                return res->isSuccess() ? std::string{} : res->getErrorMessage();
+            }
+            std::string checkpointError;
+            checkpointWithReadInWindow([&]() {
+                pauser.release();
+                reader.join();
+            });
+            return checkpointError;
+        });
+        if (checkpoint.wait_for(std::chrono::seconds(60)) != std::future_status::ready) {
+            pauser.release();
+            ADD_FAILURE() << "the checkpoint is blocked by the paused read";
+        }
+        const auto checkpointError = checkpoint.get();
+        EXPECT_TRUE(checkpointError.empty()) << checkpointError;
+        if (!resumeInShadowWindow) {
+            pauser.release();
+            reader.join();
+        }
+        return ws;
+    }
+};
+
+// The rels are only in memory, so the checkpoint flushes them into a new persistent CSR group
+// and clears the in-memory groups while the scan is reading them.
+TEST_F(CheckpointRunningRelScanTest, InMemoryRelScanStraddlesCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertRels(1, numDsts);
+    std::string error;
+    const auto ws = scanAcrossCheckpoint(false /*resumeInShadowWindow*/, error);
+    EXPECT_TRUE(error.empty()) << error;
+    checkRels(ws, expectedRels(1, numDsts), "scan resumed after the checkpoint");
+}
+
+// The rels are persistent, and the checkpoint rewrites the CSR group of node 0 (new rels and
+// deletions) while the scan is reading the old one.
+TEST_F(CheckpointRunningRelScanTest, PersistentRelScanStraddlesCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertRels(1, 4000);
+    runQuery("CHECKPOINT;");
+    insertRels(4000, numDsts);
+    runQuery("MATCH (a:P)-[r:K]->(b:P) WHERE a.id = 0 AND r.w % 7 = 0 DELETE r;");
+    std::unordered_set<int64_t> deleted;
+    for (auto i = 7; i < numDsts; i += 7) {
+        deleted.insert(i);
+    }
+    std::string error;
+    const auto ws = scanAcrossCheckpoint(false /*resumeInShadowWindow*/, error);
+    EXPECT_TRUE(error.empty()) << error;
+    checkRels(ws, expectedRels(1, numDsts, deleted), "scan resumed after the checkpoint");
+}
+
+TEST_F(CheckpointRunningRelScanTest, PersistentRelScanResumesInShadowWindow) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertRels(1, 4000);
+    runQuery("CHECKPOINT;");
+    insertRels(4000, numDsts);
+    runQuery("MATCH (a:P)-[r:K]->(b:P) WHERE a.id = 0 AND r.w % 7 = 0 DELETE r;");
+    std::unordered_set<int64_t> deleted;
+    for (auto i = 7; i < numDsts; i += 7) {
+        deleted.insert(i);
+    }
+    std::string error;
+    const auto ws = scanAcrossCheckpoint(true /*resumeInShadowWindow*/, error);
+    EXPECT_TRUE(error.empty()) << error;
+    checkRels(ws, expectedRels(1, numDsts, deleted), "scan resumed in the shadow page window");
+}
+
+// A rel scan that starts in the shadow page window of a checkpoint that updates the persistent
+// CSR group in place.
+TEST_F(CheckpointRunningRelScanTest, RelScanStartingInShadowWindow) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertRels(1, 4000);
+    runQuery("CHECKPOINT;");
+    // Pages of the persistent CSR group (data columns and CSR header) before the checkpoint.
+    auto context = getClientContext(*conn);
+    auto storageManager = StorageManager::Get(*context);
+    const auto relGroupEntry = catalog::Catalog::Get(*context)
+                                   ->getTableCatalogEntry(&DUMMY_CHECKPOINT_TRANSACTION, "K")
+                                   ->ptrCast<catalog::RelGroupCatalogEntry>();
+    auto& relTable = storageManager->getTable(relGroupEntry->getSingleRelEntryInfo().oid)
+                         ->cast<RelTable>();
+    std::unordered_set<page_idx_t> relPages;
+    auto addPages = [&](const ColumnChunk& chunk) {
+        for (const auto* segment : chunk.getSegments()) {
+            const auto& metadata = segment->getMetadata();
+            for (auto i = 0u; i < metadata.getNumPages(); i++) {
+                relPages.insert(metadata.getStartPageIdx() + i);
+            }
+        }
+    };
+    for (const auto direction : {RelDataDirection::FWD, RelDataDirection::BWD}) {
+        const auto* nodeGroup = relTable.getDirectedTableData(direction)->getNodeGroup(0);
+        ASSERT_NE(nodeGroup, nullptr);
+        const auto* persistentGroup =
+            nodeGroup->cast<CSRNodeGroup>().getPersistentChunkedGroup();
+        ASSERT_NE(persistentGroup, nullptr);
+        for (auto i = 0u; i < persistentGroup->getNumColumns(); i++) {
+            addPages(persistentGroup->getColumnChunk(i));
+        }
+        const auto& csrHeader = persistentGroup->cast<ChunkedCSRNodeGroup>().getCSRHeader();
+        addPages(*csrHeader.offset);
+        addPages(*csrHeader.length);
+    }
+    ASSERT_FALSE(relPages.empty());
+    // Few enough new rels that they fit in the gaps of their CSR regions.
+    insertRels(4000, 4010);
+    runQuery("MATCH (a:P)-[r:K]->(b:P) WHERE a.id = 0 AND r.w % 7 = 0 DELETE r;");
+    std::unordered_set<int64_t> deleted;
+    for (auto i = 7; i < 4010; i += 7) {
+        deleted.insert(i);
+    }
+
+    bool readRan = false;
+    uint64_t numShadowedRelPages = 0;
+    std::string error;
+    std::vector<int64_t> ws;
+    checkpointWithReadInWindow([&]() {
+        auto& shadowFile = storageManager->getShadowFile();
+        for (const auto pageIdx : relPages) {
+            numShadowedRelPages +=
+                shadowFile.hasShadowPage(storageManager->getDataFH()->getFileIndex(), pageIdx);
+        }
+        std::thread reader([&]() {
+            ws = scanRels(false /*pause*/, error);
+            readRan = true;
+        });
+        reader.join();
+    });
+    ASSERT_TRUE(readRan);
+    EXPECT_TRUE(error.empty()) << error;
+    EXPECT_GT(numShadowedRelPages, 0u) << "of " << relPages.size() << " persistent rel pages";
+    checkRels(ws, expectedRels(1, 4010, deleted), "scan started in the shadow page window");
 }
 #endif // __SINGLE_THREADED__
 
