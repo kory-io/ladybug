@@ -13,6 +13,7 @@
 #include "catalog/catalog_entry/table_catalog_entry.h"
 #include "common/exception/runtime.h"
 #include "storage/checkpointer.h"
+#include "storage/index/hash_index.h"
 #include "storage/page_allocator.h"
 #include "storage/page_manager.h"
 #include "storage/storage_manager.h"
@@ -654,6 +655,298 @@ TEST_F(FlakyCheckpointerTest, ReadBeforeShadowPagesAreAppliedSeesCommittedString
         EXPECT_EQ(readNames[i], getName(i));
     }
 }
+
+// Readers of other storage structures during the same window: between a checkpoint's in-place
+// shadow writes and the application of the shadow pages to the data file.
+class CheckpointShadowWindowTest : public FlakyCheckpointerTest {
+public:
+    void SetUp() override {
+        FlakyCheckpointerTest::SetUp();
+        ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+        ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    }
+
+    void runQuery(const std::string& query) const {
+        auto res = conn->query(query);
+        ASSERT_TRUE(res->isSuccess()) << query << ": " << res->getErrorMessage();
+    }
+
+    // Runs one CHECKPOINT that calls `readFunc` right before the shadow pages are applied.
+    void checkpointWithReadInWindow(const std::function<void()>& readFunc) const {
+        auto context = getClientContext(*conn);
+        FlakyCheckpointer checkpointer([&](main::ClientContext& clientContext) {
+            return std::make_unique<CheckpointerWithReadBeforeApplyingShadowPages>(clientContext,
+                readFunc);
+        });
+        checkpointer.setCheckpointer(*context);
+        auto res = conn->query("CHECKPOINT;");
+        FlakyCheckpointer::resetCheckpointer(*context);
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    }
+
+    // Number of pages of the primary key index of `tableName` (slots and string overflow) that
+    // currently have a shadow page, and the total number of such pages.
+    std::pair<uint64_t, uint64_t> countShadowedPKIndexPages(const std::string& tableName,
+        std::string& breakdown) const {
+        auto context = getClientContext(*conn);
+        auto storageManager = StorageManager::Get(*context);
+        const auto tableEntry = catalog::Catalog::Get(*context)->getTableCatalogEntry(
+            &DUMMY_CHECKPOINT_TRANSACTION, tableName);
+        auto& nodeTable = storageManager->getTable(tableEntry->getTableID())->cast<NodeTable>();
+        auto& shadowFile = storageManager->getShadowFile();
+        const auto fileIdx = storageManager->getDataFH()->getFileIndex();
+        uint64_t numPages = 0, numShadowed = 0;
+        for (const auto& entry : nodeTable.getPKIndex()->getStorageEntries()) {
+            if (entry.component != "primary_slots" && entry.component != "overflow_slots" &&
+                entry.component != "string_overflow") {
+                continue;
+            }
+            uint64_t numShadowedInEntry = 0;
+            for (auto i = 0u; i < entry.pageRange.numPages; i++) {
+                numPages++;
+                numShadowedInEntry +=
+                    shadowFile.hasShadowPage(fileIdx, entry.pageRange.startPageIdx + i);
+            }
+            if (numShadowedInEntry > 0 && breakdown.find(entry.component) == std::string::npos) {
+                breakdown += " " + entry.component;
+            }
+            numShadowed += numShadowedInEntry;
+        }
+        return {numPages, numShadowed};
+    }
+
+    // Looks up every key through the primary key (`WHERE t.id = <key>`) on a new connection and
+    // returns, for each key, the names found.
+    std::vector<std::vector<std::string>> lookupKeys(const std::vector<std::string>& keyLiterals,
+        std::string& error) const {
+        std::vector<std::vector<std::string>> result(keyLiterals.size());
+        auto readConn = std::make_unique<main::Connection>(database.get());
+        for (auto i = 0u; i < keyLiterals.size(); i++) {
+            auto res = readConn->query(
+                std::format("MATCH (t:test) WHERE t.id = {} RETURN t.name;", keyLiterals[i]));
+            if (!res->isSuccess()) {
+                error = res->getErrorMessage();
+                return result;
+            }
+            while (res->hasNext()) {
+                result[i].push_back(res->getNext()->getValue(0)->getValue<std::string>());
+            }
+        }
+        return result;
+    }
+
+    // Primary key lookups while the checkpoint that merges the index inserts (and applies the
+    // deletions) of `numInitialRows..numRows` is in its shadow page window.
+    void runPKLookupDuringShadowWindow(const std::string& keyType,
+        const std::function<std::string(int64_t)>& keyLiteral, bool reopenAfterFirstCheckpoint) {
+        constexpr int64_t numInitialRows = 1000;
+        constexpr int64_t numRows = 1200;
+        // One deleted key that was checkpointed before and one that was not.
+        const std::unordered_set<int64_t> deletedKeys{5, 1100};
+        runQuery(std::format("CREATE NODE TABLE test(id {} PRIMARY KEY, name STRING);", keyType));
+        auto insertRows = [&](int64_t start, int64_t end) {
+            for (auto i = start; i < end; i++) {
+                runQuery(
+                    std::format("CREATE (:test {{id: {}, name: 'name_{}'}});", keyLiteral(i), i));
+            }
+        };
+        insertRows(0, numInitialRows);
+        runQuery("CHECKPOINT;");
+        if (reopenAfterFirstCheckpoint) {
+            createDBAndConn();
+            runQuery("CALL force_checkpoint_on_close=false;");
+            runQuery("CALL auto_checkpoint=false;");
+        }
+        // Few enough new keys that they fit in the slots already on disk, so the checkpoint
+        // merges them into existing slot pages in place (through the shadow file).
+        insertRows(numInitialRows, numRows);
+        for (const auto key : deletedKeys) {
+            runQuery(std::format("MATCH (t:test) WHERE t.id = {} DELETE t;", keyLiteral(key)));
+        }
+
+        std::vector<std::string> keyLiterals;
+        for (auto i = 0; i < numRows; i++) {
+            keyLiterals.push_back(keyLiteral(i));
+        }
+        auto checkLookups = [&](const std::vector<std::vector<std::string>>& found,
+                                const std::string& when) {
+            std::vector<int64_t> wrongKeys;
+            for (auto i = 0; i < numRows; i++) {
+                std::vector<std::string> expected;
+                if (!deletedKeys.contains(i)) {
+                    expected.push_back(std::format("name_{}", i));
+                }
+                if (found[i] != expected) {
+                    wrongKeys.push_back(i);
+                }
+            }
+            std::string sample;
+            for (auto i = 0u; i < std::min<size_t>(wrongKeys.size(), 10); i++) {
+                sample += std::format(" {}(found {})", wrongKeys[i], found[wrongKeys[i]].size());
+            }
+            EXPECT_TRUE(wrongKeys.empty())
+                << when << ": " << wrongKeys.size() << " of " << numRows
+                << " primary key lookups returned wrong results, e.g." << sample;
+        };
+
+        bool readRan = false;
+        std::pair<uint64_t, uint64_t> shadowedPages;
+        std::string shadowedBreakdown;
+        std::string readError;
+        std::vector<std::vector<std::string>> found;
+        checkpointWithReadInWindow([&]() {
+            shadowedPages = countShadowedPKIndexPages("test", shadowedBreakdown);
+            std::thread reader([&]() {
+                found = lookupKeys(keyLiterals, readError);
+                readRan = true;
+            });
+            reader.join();
+        });
+        ASSERT_TRUE(readRan);
+        ASSERT_TRUE(readError.empty()) << readError;
+        // The updated index pages are only in the shadow file at this point.
+        ASSERT_GT(shadowedPages.second, 0u) << "of " << shadowedPages.first << " index pages";
+        checkLookups(found,
+            std::format("during the shadow page window ({} of {} index pages shadowed:{})",
+                shadowedPages.second, shadowedPages.first, shadowedBreakdown));
+
+        std::string afterError;
+        const auto foundAfter = lookupKeys(keyLiterals, afterError);
+        ASSERT_TRUE(afterError.empty()) << afterError;
+        checkLookups(foundAfter, "after the checkpoint");
+    }
+};
+
+// Reopens the database after the first checkpoint, so the index is loaded from disk and its
+// disk arrays compute their last page on disk from the loaded headers. (A disk array only shadows
+// pages up to its last page on disk; the non-reopen path depends on the index publishing its disk
+// array headers before recomputing it.)
+TEST_F(CheckpointShadowWindowTest, Int64PrimaryKeyLookupDuringShadowWindowAfterReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runPKLookupDuringShadowWindow("INT64", [](int64_t i) { return std::to_string(i); },
+        true /*reopenAfterFirstCheckpoint*/);
+}
+
+// Without a reopen (see above). Both slot pages and string overflow pages are shadowed.
+TEST_F(CheckpointShadowWindowTest, StringPrimaryKeyLookupDuringShadowWindow) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    // Longer than the inline string limit, so the keys live in the index's overflow file.
+    runPKLookupDuringShadowWindow("STRING",
+        [](int64_t i) { return std::format("'a primary key longer than inline {:05}'", i); },
+        false /*reopenAfterFirstCheckpoint*/);
+}
+
+TEST_F(CheckpointShadowWindowTest, StringPrimaryKeyLookupDuringShadowWindowAfterReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runPKLookupDuringShadowWindow("STRING",
+        [](int64_t i) { return std::format("'a primary key longer than inline {:05}'", i); },
+        true /*reopenAfterFirstCheckpoint*/);
+}
+
+// A checkpoint that fails after its storage phase (here while serializing the catalog) must leave
+// the primary key index usable both in the running database and after a reopen, which replays the
+// WAL on top of the last successful checkpoint.
+class FailedCheckpointPKIndexOriginalReproTest : public CheckpointShadowWindowTest {
+public:
+    static constexpr int64_t numInitialRows = 1000;
+    static constexpr int64_t numRows = 1200;
+
+    void checkPKLookups(const std::string& when) const {
+        std::vector<int64_t> missing;
+        for (auto i = 0; i < numRows; i++) {
+            auto res = conn->query(std::format("MATCH (t:test) WHERE t.id = {} RETURN t.id;", i));
+            ASSERT_TRUE(res->isSuccess()) << when << ": " << res->getErrorMessage();
+            if (res->getNumTuples() != 1) {
+                missing.push_back(i);
+            }
+        }
+        EXPECT_TRUE(missing.empty()) << when << ": " << missing.size() << " of " << numRows
+                                     << " keys not found by primary key lookup, first "
+                                     << (missing.empty() ? -1 : missing.front());
+    }
+
+    // Checkpoints keys 0..numInitialRows, inserts keys numInitialRows..numRows and then runs a
+    // checkpoint that fails while serializing the catalog.
+    void insertAndFailCheckpoint(bool reopenAfterFirstCheckpoint) {
+        runQuery("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
+        runQuery(std::format("UNWIND range(0, {}) AS i CREATE (:test {{id: i, name: 'n'}});",
+            numInitialRows - 1));
+        runQuery("CHECKPOINT;");
+        if (reopenAfterFirstCheckpoint) {
+            createDBAndConn();
+            runQuery("CALL force_checkpoint_on_close=false;");
+            runQuery("CALL auto_checkpoint=false;");
+        }
+        // Merged into the slot pages written by the first checkpoint.
+        runQuery(std::format("UNWIND range({}, {}) AS i CREATE (:test {{id: i, name: 'n'}});",
+            numInitialRows, numRows - 1));
+        auto context = getClientContext(*conn);
+        FlakyCheckpointer flakyCheckpointer([](main::ClientContext& ctx) {
+            return std::make_unique<FlakyCheckpointerFailsOnSerialization>(ctx);
+        });
+        flakyCheckpointer.setCheckpointer(*context);
+        ASSERT_FALSE(conn->query("CHECKPOINT;")->isSuccess());
+        FlakyCheckpointer::resetCheckpointer(*context);
+    }
+
+    void runTest(bool reopenAfterFirstCheckpoint) {
+        insertAndFailCheckpoint(reopenAfterFirstCheckpoint);
+        checkPKLookups("after the failed checkpoint");
+        try {
+            createDBAndConn();
+        } catch (const Exception& e) {
+            FAIL() << "reopening after the failed checkpoint: " << e.what();
+        }
+        checkPKLookups("after reopening");
+    }
+};
+
+// See Int64PrimaryKeyLookupDuringShadowWindowAfterReopen for the difference between the variants.
+TEST_F(FailedCheckpointPKIndexOriginalReproTest, PrimaryKeyLookupsAfterFailedCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runTest(false /*reopenAfterFirstCheckpoint*/);
+}
+
+TEST_F(FailedCheckpointPKIndexOriginalReproTest,
+    PrimaryKeyLookupsAfterFailedCheckpointAfterReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runTest(true /*reopenAfterFirstCheckpoint*/);
+}
+
+// A key inserted since the last successful checkpoint must still be unique after a failed
+// checkpoint, and must be persisted exactly once by the next successful one.
+TEST_F(FailedCheckpointPKIndexOriginalReproTest,
+    DuplicatePrimaryKeyRejectedAfterFailedCheckpointAfterReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    insertAndFailCheckpoint(true /*reopenAfterFirstCheckpoint*/);
+    EXPECT_FALSE(conn->query("CREATE (:test {id: 1000, name: 'duplicate'});")->isSuccess())
+        << "duplicate of a key inserted since the last checkpoint was accepted";
+    runQuery("CHECKPOINT;");
+    try {
+        createDBAndConn();
+    } catch (const Exception& e) {
+        FAIL() << "reopening after the successful checkpoint: " << e.what();
+    }
+    auto res = conn->query("MATCH (t:test) WHERE t.id = 1000 RETURN t.name;");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    EXPECT_EQ(res->getNumTuples(), 1u);
+    auto count = conn->query("MATCH (t:test) RETURN COUNT(t);");
+    ASSERT_TRUE(count->isSuccess()) << count->getErrorMessage();
+    EXPECT_EQ(count->getNext()->getValue(0)->getValue<int64_t>(), numRows);
+}
+
 #endif // __SINGLE_THREADED__
 
 // ─────────────────────────────────────────────────────────────────────────────
