@@ -856,6 +856,74 @@ TEST_F(CheckpointShadowWindowTest, StringPrimaryKeyLookupDuringShadowWindowAfter
         true /*reopenAfterFirstCheckpoint*/);
 }
 
+// A checkpoint that fails after its storage phase (here while serializing the catalog) must leave
+// the primary key index usable both in the running database and after a reopen, which replays the
+// WAL on top of the last successful checkpoint.
+class FailedCheckpointPKIndexTest : public CheckpointShadowWindowTest {
+public:
+    static constexpr int64_t numInitialRows = 1000;
+    static constexpr int64_t numRows = 1200;
+
+    void checkPKLookups(const std::string& when) const {
+        std::vector<int64_t> missing;
+        for (auto i = 0; i < numRows; i++) {
+            auto res = conn->query(std::format("MATCH (t:test) WHERE t.id = {} RETURN t.id;", i));
+            ASSERT_TRUE(res->isSuccess()) << when << ": " << res->getErrorMessage();
+            if (res->getNumTuples() != 1) {
+                missing.push_back(i);
+            }
+        }
+        EXPECT_TRUE(missing.empty()) << when << ": " << missing.size() << " of " << numRows
+                                     << " keys not found by primary key lookup, first "
+                                     << (missing.empty() ? -1 : missing.front());
+    }
+
+    void runTest(bool reopenAfterFirstCheckpoint) {
+        runQuery("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
+        runQuery(std::format("UNWIND range(0, {}) AS i CREATE (:test {{id: i, name: 'n'}});",
+            numInitialRows - 1));
+        runQuery("CHECKPOINT;");
+        if (reopenAfterFirstCheckpoint) {
+            createDBAndConn();
+            runQuery("CALL force_checkpoint_on_close=false;");
+            runQuery("CALL auto_checkpoint=false;");
+        }
+        // Merged into the slot pages written by the first checkpoint.
+        runQuery(std::format("UNWIND range({}, {}) AS i CREATE (:test {{id: i, name: 'n'}});",
+            numInitialRows, numRows - 1));
+        auto context = getClientContext(*conn);
+        FlakyCheckpointer flakyCheckpointer([](main::ClientContext& ctx) {
+            return std::make_unique<FlakyCheckpointerFailsOnSerialization>(ctx);
+        });
+        flakyCheckpointer.setCheckpointer(*context);
+        ASSERT_FALSE(conn->query("CHECKPOINT;")->isSuccess());
+        FlakyCheckpointer::resetCheckpointer(*context);
+        checkPKLookups("after the failed checkpoint");
+        try {
+            createDBAndConn();
+        } catch (const Exception& e) {
+            FAIL() << "reopening after the failed checkpoint: " << e.what();
+        }
+        checkPKLookups("after reopening");
+    }
+};
+
+// See Int64PrimaryKeyLookupDuringShadowWindowAfterReopen: without a reopen, the second checkpoint
+// writes the existing slot pages in place without shadowing them.
+TEST_F(FailedCheckpointPKIndexTest, PrimaryKeyLookupsAfterFailedCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runTest(false /*reopenAfterFirstCheckpoint*/);
+}
+
+TEST_F(FailedCheckpointPKIndexTest, PrimaryKeyLookupsAfterFailedCheckpointAfterReopen) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    runTest(true /*reopenAfterFirstCheckpoint*/);
+}
+
 // Pauses a query at the first row it evaluates `pause_scan(x)` on, until released, so that a scan
 // can be left in progress while another thread checkpoints.
 class ScanPauser {
