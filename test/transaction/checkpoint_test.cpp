@@ -1303,5 +1303,97 @@ TEST_F(ReviewFixesTest, SubgraphCatalogPersistsAfterCheckpointWithPreExistingTab
     ASSERT_TRUE(conn->query("USE GRAPH main;")->isSuccess());
 }
 
+// Runs a checkpoint whose first page allocation fails, then checks that the committed data reads
+// back unchanged before any reopen, after a retry succeeds, and after reopening the database.
+class FailedInPlaceCheckpointTest : public FlakyCheckpointerTest {
+public:
+    std::vector<std::string> queryRows(const std::string& query) const {
+        auto res = conn->query(query);
+        EXPECT_TRUE(res->isSuccess()) << res->getErrorMessage();
+        std::vector<std::string> rows;
+        if (!res->isSuccess()) {
+            return rows;
+        }
+        while (res->hasNext()) {
+            auto row = res->getNext()->toString();
+            if (!row.empty() && row.back() == '\n') {
+                row.pop_back();
+            }
+            rows.push_back(std::move(row));
+        }
+        return rows;
+    }
+
+    void failFirstAllocationInCheckpoint() const {
+        auto context = getClientContext(*conn);
+        bool failed = false;
+        FlakyCheckpointer flakyCheckpointer([&failed](main::ClientContext& ctx) {
+            return std::make_unique<FlakyCheckpointerFailsDuringOutOfPlaceRewrite>(ctx, failed);
+        });
+        flakyCheckpointer.setCheckpointer(*context);
+        auto res = conn->query("CHECKPOINT;");
+        FlakyCheckpointer::resetCheckpointer(*context);
+        ASSERT_FALSE(res->isSuccess());
+        ASSERT_TRUE(failed);
+    }
+
+    void checkpoint() const {
+        auto res = conn->query("CHECKPOINT;");
+        ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    }
+};
+
+// Rel data columns of a CSR node group are rewritten in the new CSR layout before the CSR header
+// (offsets and lengths) is checkpointed. Each node starts with a single rel, while the rel
+// properties and IDs leave room in their bit widths and pages. Adding a second rel to one node
+// then rewrites all data columns in place, and the new CSR offsets and lengths no longer fit in
+// place, so the first page allocation of the checkpoint, where the injected failure lands, is the
+// out-of-place rewrite of the CSR header.
+TEST_F(FailedInPlaceCheckpointTest, RelsReadBackAfterFailedCSRHeaderCheckpoint) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    ASSERT_TRUE(conn->query("CALL force_checkpoint_on_close=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CALL auto_checkpoint=false;")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE NODE TABLE n(id INT64 PRIMARY KEY);")->isSuccess());
+    ASSERT_TRUE(conn->query("CREATE REL TABLE e(FROM n TO n, w INT64);")->isSuccess());
+    constexpr int64_t numNodes = 1000;
+    ASSERT_TRUE(
+        conn->query(std::format("UNWIND range(0, {}) AS i CREATE (:n {{id: i}});", numNodes - 1))
+            ->isSuccess());
+    auto res = conn->query(std::format(
+        "MATCH (a:n), (b:n) WHERE b.id = (a.id + 1) % {} CREATE (a)-[:e {{w: a.id}}]->(b);",
+        numNodes));
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    checkpoint();
+    res = conn->query("MATCH (a:n {id: 0}), (b:n {id: 500}) CREATE (a)-[:e {w: 7}]->(b);");
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+
+    std::vector<std::string> expected;
+    for (int64_t i = 0; i < numNodes; i++) {
+        expected.push_back(std::format("{}|{}|{}", i, (i + 1) % numNodes, i));
+        if (i == 0) {
+            expected.push_back("0|500|7");
+        }
+    }
+    const std::string fwdQuery =
+        "MATCH (a:n)-[r:e]->(b:n) RETURN a.id, b.id, r.w ORDER BY a.id, b.id, r.w;";
+    const std::string bwdQuery =
+        "MATCH (b:n)<-[r:e]-(a:n) RETURN a.id, b.id, r.w ORDER BY a.id, b.id, r.w;";
+    auto check = [&](const std::string& when) {
+        EXPECT_EQ(queryRows(fwdQuery), expected) << "forward, " << when;
+        EXPECT_EQ(queryRows(bwdQuery), expected) << "backward, " << when;
+    };
+    check("before the failed checkpoint");
+    failFirstAllocationInCheckpoint();
+    check("after the failed checkpoint");
+    checkpoint();
+    check("after the retried checkpoint");
+    // Query results must not outlive the database they were read from.
+    res.reset();
+    createDBAndConn();
+    check("after reopening");
+}
+
 } // namespace testing
 } // namespace lbug
