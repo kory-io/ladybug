@@ -561,6 +561,23 @@ private:
     std::function<void()> readFunc;
 };
 
+// Calls `readFunc` right after the shadow pages are applied to the data file, before the
+// post-checkpoint cleanup publishes staged in-memory state.
+class CheckpointerWithReadAfterApplyingShadowPages final : public Checkpointer {
+public:
+    CheckpointerWithReadAfterApplyingShadowPages(main::ClientContext& clientContext,
+        std::function<void()> readFunc)
+        : Checkpointer(clientContext), readFunc(std::move(readFunc)) {}
+
+    void logCheckpointAndApplyShadowPages(bool walRotated) override {
+        Checkpointer::logCheckpointAndApplyShadowPages(walRotated);
+        readFunc();
+    }
+
+private:
+    std::function<void()> readFunc;
+};
+
 #ifndef __SINGLE_THREADED__
 TEST_F(FlakyCheckpointerTest, ReadBeforeShadowPagesAreAppliedSeesCommittedStrings) {
     if (inMemMode || systemConfig->checkpointThreshold == 0) {
@@ -847,6 +864,94 @@ TEST_F(CheckpointShadowWindowTest, StringPrimaryKeyLookupDuringShadowWindowAfter
     runPKLookupDuringShadowWindow("STRING",
         [](int64_t i) { return std::format("'a primary key longer than inline {:05}'", i); },
         true /*reopenAfterFirstCheckpoint*/);
+}
+
+// Primary key lookups right after the shadow pages are applied, before the index publishes its
+// new read headers. The checkpoint grows the index enough to split slots, so some previously
+// checkpointed keys move to slots that the old read headers do not map them to.
+TEST_F(CheckpointShadowWindowTest, Int64PrimaryKeyLookupAfterShadowApplyBeforePublish) {
+    if (inMemMode || systemConfig->checkpointThreshold == 0) {
+        GTEST_SKIP();
+    }
+    // The index is split into 256 hash indexes, each starting with one page of slots, so the
+    // initial keys fit without splitting and the new ones force most slots to split.
+    constexpr int64_t numInitialRows = 20000;
+    constexpr int64_t numRows = 120000;
+    constexpr int64_t numKeysToCheck = 3000;
+    runQuery("CREATE NODE TABLE test(id INT64 PRIMARY KEY, name STRING);");
+    runQuery(std::format(
+        "UNWIND range(0, {}) AS i CREATE (:test {{id: i, name: 'name_' + string(i)}});",
+        numInitialRows - 1));
+    runQuery("CHECKPOINT;");
+    runQuery(std::format(
+        "UNWIND range({}, {}) AS i CREATE (:test {{id: i, name: 'name_' + string(i)}});",
+        numInitialRows, numRows - 1));
+    // Checkpointed keys (the ones splits can move) and some new keys.
+    std::vector<int64_t> keys;
+    for (auto i = 0; i < numKeysToCheck; i++) {
+        keys.push_back(i);
+        keys.push_back(numInitialRows + i);
+    }
+    std::vector<std::string> keyLiterals;
+    for (const auto key : keys) {
+        keyLiterals.push_back(std::to_string(key));
+    }
+    bool readRan = false;
+    std::vector<std::string> errors;
+    std::vector<std::vector<std::string>> found;
+    auto context = getClientContext(*conn);
+    FlakyCheckpointer checkpointer([&](main::ClientContext& clientContext) {
+        return std::make_unique<CheckpointerWithReadAfterApplyingShadowPages>(clientContext,
+            [&]() {
+                std::thread reader([&]() {
+                    auto readConn = std::make_unique<main::Connection>(database.get());
+                    for (const auto& key : keyLiterals) {
+                        auto res = readConn->query(std::format(
+                            "MATCH (t:test) WHERE t.id = {} RETURN t.name;", key));
+                        std::vector<std::string> names;
+                        if (!res->isSuccess()) {
+                            errors.push_back(res->getErrorMessage());
+                            names.push_back("<error>");
+                        }
+                        while (res->isSuccess() && res->hasNext()) {
+                            names.push_back(res->getNext()->getValue(0)->getValue<std::string>());
+                        }
+                        found.push_back(std::move(names));
+                    }
+                    readRan = true;
+                });
+                reader.join();
+            });
+    });
+    checkpointer.setCheckpointer(*context);
+    auto res = conn->query("CHECKPOINT;");
+    FlakyCheckpointer::resetCheckpointer(*context);
+    ASSERT_TRUE(res->isSuccess()) << res->getErrorMessage();
+    ASSERT_TRUE(readRan);
+    std::vector<int64_t> wrongKeys;
+    size_t numWrongOld = 0;
+    for (auto i = 0u; i < keys.size(); i++) {
+        if (found[i] != std::vector<std::string>{std::format("name_{}", keys[i])}) {
+            wrongKeys.push_back(keys[i]);
+            numWrongOld += keys[i] < numInitialRows;
+        }
+    }
+    EXPECT_TRUE(wrongKeys.empty())
+        << wrongKeys.size() << " of " << keys.size() << " primary key lookups (" << numWrongOld
+        << " of them checkpointed keys) wrong after the shadow pages were applied, "
+        << errors.size() << " failed, first wrong key "
+        << (wrongKeys.empty() ? -1 : wrongKeys.front()) << ", first error: "
+        << (errors.empty() ? "none" : errors.front());
+    // Once the checkpoint has published the new read headers, every lookup succeeds again.
+    std::string afterError;
+    const auto foundAfter = lookupKeys(keyLiterals, afterError);
+    ASSERT_TRUE(afterError.empty()) << afterError;
+    size_t numWrongAfter = 0;
+    for (auto i = 0u; i < keys.size(); i++) {
+        numWrongAfter +=
+            foundAfter[i] != std::vector<std::string>{std::format("name_{}", keys[i])};
+    }
+    EXPECT_EQ(numWrongAfter, 0u) << "after the checkpoint";
 }
 
 // A checkpoint that fails after its storage phase (here while serializing the catalog) must leave
